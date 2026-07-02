@@ -403,9 +403,10 @@ export default function SimulatorPage() {
     let cancelled = false;
     const load = async () => {
       try {
+        const base = process.env.NEXT_PUBLIC_BASE_PATH || '';
         const [pillowBuf, headBuf] = await Promise.all([
-          fetch('/default-pillow.stl').then((r) => r.arrayBuffer()),
-          fetch('/default-head.stl').then((r) => r.arrayBuffer()),
+          fetch(`${base}/default-pillow.stl`).then((r) => r.arrayBuffer()),
+          fetch(`${base}/default-head.stl`).then((r) => r.arrayBuffer()),
         ]);
         if (cancelled) return;
         // Wait until the sim/scene are ready (created by the setup effect).

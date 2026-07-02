@@ -8,3 +8,6 @@ coverage/
 
 # build info
 tsconfig.tsbuildinfo
+
+# static export
+out/

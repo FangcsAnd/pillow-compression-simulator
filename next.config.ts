@@ -1,5 +1,9 @@
 import type {NextConfig} from 'next';
 
+// When deploying to GitHub Pages the site is served from /<repo>, so a base path
+// is injected via NEXT_PUBLIC_BASE_PATH at build time. Local dev leaves it empty.
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH || '';
+
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   eslint: {
@@ -8,29 +12,15 @@ const nextConfig: NextConfig = {
   typescript: {
     ignoreBuildErrors: false,
   },
-  // Allow access to remote image placeholder.
+  // Static export so it can be hosted for free on GitHub Pages.
+  output: 'export',
+  basePath: basePath || undefined,
+  assetPrefix: basePath || undefined,
+  trailingSlash: true,
   images: {
-    remotePatterns: [
-      {
-        protocol: 'https',
-        hostname: 'picsum.photos',
-        port: '',
-        pathname: '/**', // This allows any path under the hostname
-      },
-    ],
+    unoptimized: true,
   },
-  output: 'standalone',
   transpilePackages: ['motion'],
-  webpack: (config, {dev}) => {
-    // HMR is disabled in AI Studio via DISABLE_HMR env var.
-    // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
-    if (dev && process.env.DISABLE_HMR === 'true') {
-      config.watchOptions = {
-        ignored: /.*/,
-      };
-    }
-    return config;
-  },
 };
 
 export default nextConfig;
