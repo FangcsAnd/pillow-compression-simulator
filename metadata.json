@@ -1,0 +1,6 @@
+{
+  "name": "Pillow Compression Simulator",
+  "description": "Interactive 3D simulation of memory foam pillow compression using Neo-Hookean/Ogden hyperelasticity and Prony series viscoelasticity with implicit time integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
