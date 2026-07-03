@@ -163,6 +163,11 @@ export default function SimulatorPage() {
   const [brgPoisson, setBrgPoisson] = useState<number>(0.30);  // fixed empirical Poisson for foam
   const [brgEa, setBrgEa] = useState<number>(30);              // E = a*hardness + b  (Pa)
   const [brgEb, setBrgEb] = useState<number>(0);
+
+  // ---- Cervical-curve reshaping of the imported head model ----
+  const [cervicalInput, setCervicalInput] = useState<string>('0,0,0,0,0.8,1,2.7,3.3,3.5,3.4,2.3,1.4,1.4,1.1,0.3,0.1,0,0,0,0,0');
+  const [cervicalScale, setCervicalScale] = useState<number>(1.0); // data unit -> world units
+  const [cervicalBackDir, setCervicalBackDir] = useState<1 | -1>(-1); // which Z side is posterior
   
   // Controls & View States
   const [pillowType, setPillowType] = useState<'standard' | 'contour' | 'imported'>('contour');
@@ -219,6 +224,8 @@ export default function SimulatorPage() {
   const activePointIdxRef = useRef<number[]>([]);
   // Persist the imported rigid-body (presser) mesh so it survives sim rebuilds.
   const customPresserMeshRef = useRef<THREE.Mesh | null>(null);
+  // Pristine (pre-cervical) head vertex positions, so reshaping is always from clean.
+  const headRestRef = useRef<Float32Array | null>(null);
   // Latest telemetry written by the 60fps loop; flushed to React state at low rate.
   const telemetryRef = useRef<{ fps: number; stats: any; chartData: any[] }>({
     fps: 60, stats: null, chartData: []
@@ -309,6 +316,70 @@ export default function SimulatorPage() {
       simRef.current.presser.prevPosition.z = presserZ;
     }
   }, [presserX, presserZ]);
+
+  // Reshape the imported head model's posterior (back) contour by 21 cervical-curve
+  // values (head->neck->shoulder, 4th = occiput). Only back-side vertices move in Z.
+  const applyCervical = () => {
+    const geo = customPresserMeshRef.current?.geometry;
+    const rest = headRestRef.current;
+    if (!geo || !rest) { alert('请先导入头部模型。'); return; }
+
+    const vals = cervicalInput.split(/[,\s]+/).map(Number).filter((v) => Number.isFinite(v));
+    if (vals.length < 2) { alert('请输入至少 2 个颈曲数值（示例给了 21 个）。'); return; }
+    const n = vals.length;
+
+    // Bounds from pristine positions.
+    let minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (let i = 0; i < rest.length; i += 3) {
+      const y = rest[i + 1], z = rest[i + 2];
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    const rangeY = Math.max(1e-6, maxY - minY);
+    const cz = (minZ + maxZ) / 2;
+    const halfDepth = Math.max(1e-6, (maxZ - minZ) / 2);
+
+    const pos = geo.attributes.position.array as Float32Array;
+    for (let i = 0; i < rest.length; i += 3) {
+      const rx = rest[i], ry = rest[i + 1], rz = rest[i + 2];
+      // Height fraction: point 0 at the TOP (head), last point at the bottom (shoulder).
+      const t = (maxY - ry) / rangeY;
+      const f = Math.min(n - 1, Math.max(0, t * (n - 1)));
+      const i0 = Math.floor(f);
+      const frac = f - i0;
+      const c = vals[i0] + (vals[Math.min(n - 1, i0 + 1)] - vals[i0]) * frac;
+
+      // Only posterior-side vertices move, weighted by how far back they are.
+      const side = (rz - cz) * cervicalBackDir;
+      const w = side > 0 ? Math.min(1, side / halfDepth) : 0;
+
+      pos[i] = rx;
+      pos[i + 1] = ry;
+      pos[i + 2] = rz + cervicalBackDir * c * cervicalScale * w;
+    }
+    geo.attributes.position.needsUpdate = true;
+    geo.computeVertexNormals();
+    geo.computeBoundingBox();
+
+    // Refresh collider + visuals from the reshaped geometry.
+    if (presserShape === 'anatomy') {
+      rebuildVisualPresser();
+    } else if (simRef.current && customPresserMeshRef.current) {
+      simRef.current.presser.setCustomMesh(customPresserMeshRef.current);
+    }
+  };
+
+  const resetHeadShape = () => {
+    const geo = customPresserMeshRef.current?.geometry;
+    const rest = headRestRef.current;
+    if (!geo || !rest) return;
+    (geo.attributes.position.array as Float32Array).set(rest);
+    geo.attributes.position.needsUpdate = true;
+    geo.computeVertexNormals();
+    geo.computeBoundingBox();
+    if (presserShape === 'anatomy') rebuildVisualPresser();
+    else if (simRef.current && customPresserMeshRef.current) simRef.current.presser.setCustomMesh(customPresserMeshRef.current);
+  };
 
   // Factory parameter bridge: derive engine params from macro measurements.
   const bridgeDerive = () => {
@@ -415,6 +486,7 @@ export default function SimulatorPage() {
       if (sceneRef.current && presserMeshRef.current) sceneRef.current.remove(presserMeshRef.current);
       simRef.current!.presser.setCustomMesh(mesh);
       customPresserMeshRef.current = mesh;
+      headRestRef.current = Float32Array.from(geometry.attributes.position.array as ArrayLike<number>);
       presserMeshRef.current = mesh;
       if (sceneRef.current) sceneRef.current.add(mesh);
 
@@ -1867,6 +1939,40 @@ export default function SimulatorPage() {
                     <button onClick={() => setHeadRotZ(-90)} className={`py-1 rounded border ${headRotZ === -90 ? 'bg-rose-950/20 border-rose-500/40 text-rose-300' : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:border-slate-700'}`}>侧睡 Z-90°</button>
                   </div>
                   <div className="text-[10px] text-slate-500">绕 Z 轴旋转即侧睡；碰撞体会把头部旋到对应角度再判定压陷。</div>
+                </div>
+              )}
+
+              {/* Cervical-curve reshaping of the head model */}
+              {(presserShape === 'anatomy' || presserShape === 'custom') && (
+                <div className="space-y-2 bg-slate-950/40 border border-slate-800/50 p-3.5 rounded-lg">
+                  <div className="text-[11px] font-semibold text-slate-300">颈曲修形 (21 点 · 头→颈→肩)</div>
+                  <div className="text-[10px] text-slate-500">按高度输入 21 个颈曲数值（第 4 个=枕骨，间隔 16mm）；仅沿 Z 推拉后背面轮廓。</div>
+                  <textarea
+                    rows={2}
+                    value={cervicalInput}
+                    onChange={(e) => setCervicalInput(e.target.value)}
+                    placeholder="0,0,0,0,0.8,1,2.7,3.3,3.5,3.4,2.3,1.4,1.4,1.1,0.3,0.1,0,0,0,0,0"
+                    className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-[10px] text-emerald-300 resize-none"
+                  />
+                  <div className="grid grid-cols-2 gap-3 text-[10px]">
+                    <label className="space-y-1">
+                      <span className="text-slate-400">曲度缩放 (值→单位)</span>
+                      <input type="number" step="0.1" value={cervicalScale} onChange={(e) => setCervicalScale(parseFloat(e.target.value) || 0)}
+                        className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
+                    </label>
+                    <label className="space-y-1">
+                      <span className="text-slate-400">后背朝向</span>
+                      <select value={cervicalBackDir} onChange={(e) => setCervicalBackDir(parseInt(e.target.value) === 1 ? 1 : -1)}
+                        className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300">
+                        <option value={-1}>-Z 方向</option>
+                        <option value={1}>+Z 方向</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button onClick={applyCervical} className="py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold rounded-lg transition">应用颈曲修形</button>
+                    <button onClick={resetHeadShape} className="py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs rounded-lg transition">还原头部</button>
+                  </div>
                 </div>
               )}
 
