@@ -154,6 +154,15 @@ export default function SimulatorPage() {
   });
 
   const [activePreset, setActivePreset] = useState<string>('Classic Slow-Rebound');
+
+  // ---- Factory parameter bridge (macro measurements -> engine params) ----
+  const [brgDensity, setBrgDensity] = useState<number>(55);    // kg/m^3
+  const [brgVolume, setBrgVolume] = useState<number>(1.2);     // liters
+  const [brgHardness, setBrgHardness] = useState<number>(40);  // Shore OO / Asker F reading
+  const [brgRebound, setBrgRebound] = useState<number>(4.0);   // macroscopic rebound time (s)
+  const [brgPoisson, setBrgPoisson] = useState<number>(0.30);  // fixed empirical Poisson for foam
+  const [brgEa, setBrgEa] = useState<number>(30);              // E = a*hardness + b  (Pa)
+  const [brgEb, setBrgEb] = useState<number>(0);
   
   // Controls & View States
   const [pillowType, setPillowType] = useState<'standard' | 'contour' | 'imported'>('contour');
@@ -300,6 +309,36 @@ export default function SimulatorPage() {
       simRef.current.presser.prevPosition.z = presserZ;
     }
   }, [presserX, presserZ]);
+
+  // Factory parameter bridge: derive engine params from macro measurements.
+  const bridgeDerive = () => {
+    const E = Math.max(1, brgEa * brgHardness + brgEb);         // Young's modulus (Pa)
+    const nu = Math.min(0.49, Math.max(0, brgPoisson));         // Poisson (clamp < 0.5)
+    const mu = E / (2 * (1 + nu));                              // shear modulus
+    const K = E / (3 * (1 - 2 * nu));                           // bulk modulus
+    const tauSlow = Math.max(0.1, brgRebound);                 // dominant relaxation
+    const tauFast = tauSlow * 0.1;                             // fast (10%)
+    const N = params.gridX * params.gridY * params.gridZ;
+    const totalMass = (brgVolume / 1000) * brgDensity;         // L->m^3 * density = kg
+    const particleMass = totalMass / Math.max(1, N);
+    return { E, nu, mu, K, tauSlow, tauFast, N, totalMass, particleMass };
+  };
+
+  const applyBridge = () => {
+    const d = bridgeDerive();
+    setActivePreset('Bridge');
+    setParams(prev => ({
+      ...prev,
+      shearModulus: Number(d.mu.toFixed(1)),
+      bulkModulus: Number(d.K.toFixed(1)),
+      lambda: Number((d.K - (2 * d.mu) / 3).toFixed(1)),
+      youngModulus: Number(d.E.toFixed(1)),
+      poissonRatio: Number(d.nu.toFixed(3)),
+      density: brgDensity,
+      tau1: Number(d.tauFast.toFixed(2)),
+      tau2: Number(d.tauSlow.toFixed(2)),
+    }));
+  };
 
   // Presets trigger
   const applyPreset = (preset: MaterialPreset) => {
@@ -1311,6 +1350,77 @@ export default function SimulatorPage() {
                 );
               })}
             </div>
+          </section>
+
+          {/* Factory Parameter Bridge */}
+          <section className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg space-y-4" id="parameter_bridge_section">
+            <div className="flex items-center space-x-2 border-b border-slate-800 pb-3">
+              <Cpu className="w-5 h-5 text-emerald-400" />
+              <h2 className="text-sm font-semibold text-slate-200 uppercase tracking-wider">工厂参数桥接 / Parameter Bridge</h2>
+            </div>
+            <p className="text-[10px] text-slate-500 leading-relaxed">输入产线宏观测量值（密度·体积 → 质量惯性、硬度 → 弹性模量、回弹时间 → 黏弹松弛），自动解算为底层引擎参数。</p>
+
+            <div className="grid grid-cols-2 gap-3 text-[11px]">
+              <label className="space-y-1">
+                <span className="text-slate-400">密度 (kg/m³)</span>
+                <input type="number" value={brgDensity} onChange={(e) => setBrgDensity(parseFloat(e.target.value) || 0)}
+                  className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
+              </label>
+              <label className="space-y-1">
+                <span className="text-slate-400">体积 (L 升)</span>
+                <input type="number" step="0.1" value={brgVolume} onChange={(e) => setBrgVolume(parseFloat(e.target.value) || 0)}
+                  className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
+              </label>
+              <label className="space-y-1">
+                <span className="text-slate-400">硬度 (Shore OO)</span>
+                <input type="number" value={brgHardness} onChange={(e) => setBrgHardness(parseFloat(e.target.value) || 0)}
+                  className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
+              </label>
+              <label className="space-y-1">
+                <span className="text-slate-400">回弹时间 (s)</span>
+                <input type="number" step="0.1" value={brgRebound} onChange={(e) => setBrgRebound(parseFloat(e.target.value) || 0)}
+                  className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
+              </label>
+            </div>
+
+            {/* Empirical constants (assumed defaults — your message's exact numbers were blank) */}
+            <details className="text-[10px] text-slate-400">
+              <summary className="cursor-pointer text-slate-500">经验常数（硬度→E 线性系数、泊松比）</summary>
+              <div className="grid grid-cols-3 gap-2 mt-2">
+                <label className="space-y-1"><span>E = a·H + b · a</span>
+                  <input type="number" value={brgEa} onChange={(e) => setBrgEa(parseFloat(e.target.value) || 0)}
+                    className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-slate-300" /></label>
+                <label className="space-y-1"><span>b</span>
+                  <input type="number" value={brgEb} onChange={(e) => setBrgEb(parseFloat(e.target.value) || 0)}
+                    className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-slate-300" /></label>
+                <label className="space-y-1"><span>泊松比 ν</span>
+                  <input type="number" step="0.01" value={brgPoisson} onChange={(e) => setBrgPoisson(parseFloat(e.target.value) || 0)}
+                    className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-slate-300" /></label>
+              </div>
+            </details>
+
+            {/* Derived readout */}
+            {(() => {
+              const d = bridgeDerive();
+              return (
+                <div className="grid grid-cols-2 gap-2 text-[10px] bg-slate-950/40 border border-slate-800/60 rounded-lg p-2.5 font-mono">
+                  <div className="text-slate-500">杨氏 E = <span className="text-emerald-400">{Math.round(d.E)} Pa</span></div>
+                  <div className="text-slate-500">总质量 = <span className="text-emerald-400">{d.totalMass.toFixed(3)} kg</span></div>
+                  <div className="text-slate-500">剪切 μ = <span className="text-emerald-400">{Math.round(d.mu)} Pa</span></div>
+                  <div className="text-slate-500">体积 K = <span className="text-emerald-400">{Math.round(d.K)} Pa</span></div>
+                  <div className="text-slate-500">τ_slow = <span className="text-emerald-400">{d.tauSlow.toFixed(1)} s</span></div>
+                  <div className="text-slate-500">τ_fast = <span className="text-emerald-400">{d.tauFast.toFixed(2)} s</span></div>
+                  <div className="text-slate-500 col-span-2">质点质量 m = M/N = <span className="text-emerald-400">{d.particleMass.toExponential(2)} kg</span>（N={d.N}）</div>
+                </div>
+              );
+            })()}
+
+            <button
+              onClick={applyBridge}
+              className="w-full py-2.5 bg-gradient-to-r from-emerald-600 to-sky-600 hover:from-emerald-500 hover:to-sky-500 text-white font-semibold text-xs rounded-lg transition-all shadow-md"
+            >
+              解算并应用到物理引擎
+            </button>
           </section>
 
           {/* Core Elasticity & Viscoelasticity Settings */}
