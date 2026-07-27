@@ -156,18 +156,18 @@ export default function SimulatorPage() {
   const [activePreset, setActivePreset] = useState<string>('Classic Slow-Rebound');
 
   // ---- Factory parameter bridge (macro measurements -> engine params) ----
-  const [brgDensity, setBrgDensity] = useState<number>(55);    // kg/m^3
-  const [brgVolume, setBrgVolume] = useState<number>(1.2);     // liters
-  const [brgHardness, setBrgHardness] = useState<number>(40);  // Shore OO / Asker F reading
+  const [brgVolume, setBrgVolume] = useState<number>(0);      // liters (0 = use weight)
+  const [brgWeight, setBrgWeight] = useState<number>(1.2);    // kg (ignored if volume > 0)
+  const [brgHardness, setBrgHardness] = useState<number>(40);  // hardness reading (D)
   const [brgRebound, setBrgRebound] = useState<number>(4.0);   // macroscopic rebound time (s)
-  const [brgPoisson, setBrgPoisson] = useState<number>(0.30);  // fixed empirical Poisson for foam
-  const [brgEa, setBrgEa] = useState<number>(30);              // E = a*hardness + b  (Pa)
-  const [brgEb, setBrgEb] = useState<number>(0);
 
   // ---- Cervical-curve reshaping of the imported head model ----
   const [cervicalInput, setCervicalInput] = useState<string>('0,0,0,0,0.8,1,2.7,3.3,3.5,3.4,2.3,1.4,1.4,1.1,0.3,0.1,0,0,0,0,0');
-  const [cervicalScale, setCervicalScale] = useState<number>(1.0); // data unit -> world units
-  const [cervicalBackDir, setCervicalBackDir] = useState<1 | -1>(-1); // which Z side is posterior
+  const [cervicalScale, setCervicalScale] = useState<number>(-0.3); // data unit -> world units
+  const [cervicalBackDir, setCervicalBackDir] = useState<1 | -1>(-1); // -1 = toward the tray / back-of-neck side
+  const [cervicalHeightAxis, setCervicalHeightAxis] = useState<'x' | 'y' | 'z'>('z'); // head->shoulder (horizontal)
+  const [cervicalOffsetAxis, setCervicalOffsetAxis] = useState<'x' | 'y' | 'z'>('y'); // push down toward pillow
+  const cervicalLineRef = useRef<THREE.Points | null>(null);
   
   // Controls & View States
   const [pillowType, setPillowType] = useState<'standard' | 'contour' | 'imported'>('contour');
@@ -319,47 +319,140 @@ export default function SimulatorPage() {
 
   // Reshape the imported head model's posterior (back) contour by 21 cervical-curve
   // values (head->neck->shoulder, 4th = occiput). Only back-side vertices move in Z.
+  const previewCervicalCurve = () => {
+    const scene = sceneRef.current;
+    if (!scene || !customPresserMeshRef.current) { alert('请先导入头部模型。'); return; }
+
+    // Remove old preview line
+    if (cervicalLineRef.current) { scene.remove(cervicalLineRef.current); cervicalLineRef.current = null; }
+
+    const vals = cervicalInput.split(/[,\s]+/).map(Number).filter((v) => Number.isFinite(v));
+    if (vals.length < 2) { alert('请输入至少 2 个颈曲数值。'); return; }
+    const n = vals.length;
+
+    // Use the model's bounds to place the preview line beside it in world space.
+    const geo = customPresserMeshRef.current.geometry;
+    geo.computeBoundingBox();
+    const box = geo.boundingBox!;
+    const min = new THREE.Vector3(), max = new THREE.Vector3();
+    box.getSize(max); box.getCenter(min); // center in local
+    const meshWorld = customPresserMeshRef.current.position;
+    const hAxisIdx = { x: 0, y: 1, z: 2 }[cervicalHeightAxis];
+    const oAxisIdx = { x: 0, y: 1, z: 2 }[cervicalOffsetAxis];
+    const totalH = box.max.getComponent(hAxisIdx) - box.min.getComponent(hAxisIdx); // model height
+
+    // Preview: 21 points in the XZ plane, Z = head→shoulder (left→right),
+    // Y = inward concavity (down = deeper). This yields a visible histogram.
+    const pts: THREE.Vector3[] = [];
+    const previewOrigin = meshWorld.clone();
+    previewOrigin.x += 6; // shift to the right of the head model
+    const previewLen = totalH * 1.2; // spread wider than model for clarity
+    for (let k = 0; k < n; k++) {
+      const p = new THREE.Vector3();
+      // Head (k=0) on the left, shoulder (k=n-1) on the right
+      p.setComponent(hAxisIdx, previewOrigin.getComponent(hAxisIdx) + (k / (n - 1)) * previewLen);
+      // Fixed X position (shifted right of model)
+      p.setComponent(0, previewOrigin.x);
+      // Fixed Z position (same plane)
+      if (hAxisIdx !== 2) p.setComponent(2, previewOrigin.z);
+      // The curve value determines how far INWARD (away from tray) the point is
+      const val = vals[k] * cervicalScale;
+      p.setComponent(oAxisIdx, previewOrigin.getComponent(oAxisIdx) - val * cervicalBackDir);
+      pts.push(p);
+    }
+
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
+    const lineMat = new THREE.PointsMaterial({ color: 0x10b981, size: 0.5 });
+    const line = new THREE.Points(lineGeo, lineMat);
+    scene.add(line);
+    cervicalLineRef.current = line;
+  };
+
   const applyCervical = () => {
+    console.log('[applyCervical] called');
     const geo = customPresserMeshRef.current?.geometry;
     const rest = headRestRef.current;
-    if (!geo || !rest) { alert('请先导入头部模型。'); return; }
+    console.log('[applyCervical] geo=', !!geo, 'rest=', !!rest, 'mesh=', !!customPresserMeshRef.current, 'cervicalScale=', cervicalScale);
+    if (!geo || !rest) {
+      alert(`缺少数据：geo=${!!geo} rest=${!!rest}。请确认已导入头部模型。`);
+      return;
+    }
 
     const vals = cervicalInput.split(/[,\s]+/).map(Number).filter((v) => Number.isFinite(v));
     if (vals.length < 2) { alert('请输入至少 2 个颈曲数值（示例给了 21 个）。'); return; }
     const n = vals.length;
 
-    // Bounds from pristine positions.
-    let minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
-    for (let i = 0; i < rest.length; i += 3) {
-      const y = rest[i + 1], z = rest[i + 2];
-      if (y < minY) minY = y; if (y > maxY) maxY = y;
-      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
-    }
-    const rangeY = Math.max(1e-6, maxY - minY);
-    const cz = (minZ + maxZ) / 2;
-    const halfDepth = Math.max(1e-6, (maxZ - minZ) / 2);
+    const hAxis = { x: 0, y: 1, z: 2 }[cervicalHeightAxis]; // height (head->shoulder)
+    const oAxis = { x: 0, y: 1, z: 2 }[cervicalOffsetAxis]; // posterior push toward tray
 
+    // ── identify the "tray" direction (which way points toward the pillow) ──
+    // oAxis=Y, backDir=-1  →  −Y is toward the tray = protrusion direction
+    const trayDir = cervicalBackDir; // +1 or -1 along the offset axis
+
+    // Quick scan: height range (tray-side only) + tray midpoint
+    let sh = Infinity, oh = -Infinity, oMin = Infinity, oMax = -Infinity;
+    for (let i = 0; i < rest.length; i += 3) {
+      const t = rest[i + oAxis] * trayDir;
+      if (t < oMin) oMin = t; if (t > oMax) oMax = t;
+    }
+    const mid = (oMin + oMax) / 2;
+    for (let i = 0; i < rest.length; i += 3) {
+      if (rest[i + oAxis] * trayDir <= mid) continue;
+      const h = rest[i + hAxis];
+      if (h < sh) sh = h; if (h > oh) oh = h;
+    }
+    // ── Anchor the straight reference line ──
+    // head anchor = head‑zone most‑tray Y   (top of Z range)
+    // shoulder anchor = shoulder‑zone most‑tray Y   (bottom of Z range)
+    // Sample the top & bottom 10% of the Z‑range for the most‑tray point
+    let headYC = 0, shYC = 0, headCnt = 0, shCnt = 0;
+    const margin = (oh - sh) * 0.10;
+    for (let i = 0; i < rest.length; i += 3) {
+      const z = rest[i + hAxis];
+      const tv = rest[i + oAxis] * trayDir;
+      if (z >= oh - margin) { headYC += tv; headCnt++; }
+      if (z <= sh + margin) { shYC += tv; shCnt++; }
+    }
+    headYC = headCnt ? headYC / headCnt : 0;
+    shYC = shCnt ? shYC / shCnt : 0;
+    const rangeH = Math.max(1e-6, oh - sh);
+
+    console.log(`[cervical] head(z≈${oh.toFixed(1)},tray=${headYC.toFixed(2)})  shoulder(z≈${sh.toFixed(1)},tray=${shYC.toFixed(2)})`);
+
+    // For each tray‑side vertex at Z height, target = straight‑line Y(z) − curveVal(z)
+    let maxDisp = 0;
     const pos = geo.attributes.position.array as Float32Array;
     for (let i = 0; i < rest.length; i += 3) {
-      const rx = rest[i], ry = rest[i + 1], rz = rest[i + 2];
-      // Height fraction: point 0 at the TOP (head), last point at the bottom (shoulder).
-      const t = (maxY - ry) / rangeY;
-      const f = Math.min(n - 1, Math.max(0, t * (n - 1)));
-      const i0 = Math.floor(f);
-      const frac = f - i0;
-      const c = vals[i0] + (vals[Math.min(n - 1, i0 + 1)] - vals[i0]) * frac;
+      pos[i] = rest[i];
+      pos[i + 1] = rest[i + 1];
+      pos[i + 2] = rest[i + 2];
 
-      // Only posterior-side vertices move, weighted by how far back they are.
-      const side = (rz - cz) * cervicalBackDir;
-      const w = side > 0 ? Math.min(1, side / halfDepth) : 0;
+      // Only posterior (tray‑side) vertices, not the face
+      if (rest[i + oAxis] * trayDir <= mid) continue;
+      const z = rest[i + hAxis];
+      if (z < sh || z > oh) continue;
 
-      pos[i] = rx;
-      pos[i + 1] = ry;
-      pos[i + 2] = rz + cervicalBackDir * c * cervicalScale * w;
+      // Straight line interpolation: refT = shoulder + (head − shoulder)*t , t=0→1
+      const t = (z - sh) / rangeH;
+      const refT = shYC + (headYC - shYC) * t;
+
+      const idx = Math.round(t * (n - 1));
+      const cv = vals[Math.max(0, Math.min(n - 1, idx))] * cervicalScale;
+      const target = (refT - cv) * trayDir;
+      pos[i + oAxis] = target;
+      const disp = Math.abs(target - rest[i + oAxis]);
+      if (disp > maxDisp) maxDisp = disp;
     }
+    console.log(`[cervical] max displacement = ${maxDisp.toFixed(3)}`);
     geo.attributes.position.needsUpdate = true;
     geo.computeVertexNormals();
+    if (geo.attributes.normal) geo.attributes.normal.needsUpdate = true;
     geo.computeBoundingBox();
+
+    // Force Three.js to re-upload the buffers to the GPU.
+    if (customPresserMeshRef.current) {
+      customPresserMeshRef.current.updateMatrix();
+    }
 
     // Refresh collider + visuals from the reshaped geometry.
     if (presserShape === 'anatomy') {
@@ -367,6 +460,88 @@ export default function SimulatorPage() {
     } else if (simRef.current && customPresserMeshRef.current) {
       simRef.current.presser.setCustomMesh(customPresserMeshRef.current);
     }
+  };
+
+  // Generate a new head geometry from cervical curve: a curved surface (height-field)
+  // that replaces the tray-facing side while keeping the top of the head intact.
+  const buildHeadFromCervical = () => {
+    const scene = sceneRef.current;
+    const sim = simRef.current;
+    if (!scene || !sim || !customPresserMeshRef.current) { alert('请先导入头部模型。'); return; }
+
+    const vals = cervicalInput.split(/[,\s]+/).map(Number).filter((v) => Number.isFinite(v));
+    if (vals.length < 2) { alert('请输入至少 2 个颈曲数值。'); return; }
+    const n = vals.length;
+
+    const srcGeo = customPresserMeshRef.current.geometry;
+    srcGeo.computeBoundingBox();
+    const bbox = srcGeo.boundingBox!;
+    const hAxisIdx = { x: 0, y: 1, z: 2 }[cervicalHeightAxis];
+    const oAxisIdx = { x: 0, y: 1, z: 2 }[cervicalOffsetAxis];
+
+    const hMin = bbox.min.getComponent(hAxisIdx);
+    const hMax = bbox.max.getComponent(hAxisIdx);
+    const rangeH = Math.max(1e-6, hMax - hMin);
+    // Estimate the model width along the remaining axis
+    const wAxisIdx = 3 - hAxisIdx - oAxisIdx; // the 3rd axis
+    const wMin = bbox.min.getComponent(wAxisIdx);
+    const wMax = bbox.max.getComponent(wAxisIdx);
+
+    // Build a grid of vertices: spans height (n points) × width (8 subdivisions)
+    const hSeg = n - 1;
+    const wSeg = 8;
+    const verts: number[] = [];
+    const indices: number[] = [];
+
+    const p = (k: number, w: number) => {
+      const t = k / hSeg;
+      const h = hMin + t * rangeH;
+      const wc = wMin + (w / wSeg) * (wMax - wMin);
+      const v = new THREE.Vector3();
+      v.setComponent(hAxisIdx, h);
+      v.setComponent(wAxisIdx, wc);
+      // Tray-axis position = baseline at head/shoulder + curveVal * scale (inwards)
+      const baseline = bbox.max.getComponent(oAxisIdx); // most protruding point
+      const curveVal = vals[k] * cervicalScale;
+      v.setComponent(oAxisIdx, baseline - curveVal * cervicalBackDir);
+      return v;
+    };
+
+    for (let w = 0; w <= wSeg; w++) {
+      for (let k = 0; k <= hSeg; k++) {
+        const v = p(k, w);
+        verts.push(v.x, v.y, v.z);
+        if (w < wSeg && k < hSeg) {
+          const a = w * (hSeg + 1) + k;
+          const b = a + 1;
+          const c = a + (hSeg + 1);
+          const d = c + 1;
+          indices.push(a, b, d, a, d, c);
+        }
+      }
+    }
+
+    const newGeo = new THREE.BufferGeometry();
+    newGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
+    newGeo.setIndex(indices);
+    newGeo.computeVertexNormals();
+
+    // Apply the same material as the original head
+    const mat = customPresserMeshRef.current.material;
+    const mesh = new THREE.Mesh(newGeo, mat);
+    mesh.castShadow = true; mesh.receiveShadow = true;
+
+    // Replace in scene
+    if (presserMeshRef.current) scene.remove(presserMeshRef.current);
+    if (anatomyRef.current) { scene.remove(anatomyRef.current.group); anatomyRef.current = null; }
+
+    scene.add(mesh);
+    presserMeshRef.current = mesh;
+    customPresserMeshRef.current = mesh;
+    if (simRef.current) simRef.current.presser.setCustomMesh(mesh);
+
+    setPresserShape('custom');
+    headRestRef.current = Float32Array.from(verts); // update pristine copy
   };
 
   const resetHeadShape = () => {
@@ -383,16 +558,19 @@ export default function SimulatorPage() {
 
   // Factory parameter bridge: derive engine params from macro measurements.
   const bridgeDerive = () => {
-    const E = Math.max(1, brgEa * brgHardness + brgEb);         // Young's modulus (Pa)
-    const nu = Math.min(0.49, Math.max(0, brgPoisson));         // Poisson (clamp < 0.5)
+    // Density estimated from hardness (memory foam typical correlation)
+    const estDensity = 35 + brgHardness * 0.5;
+    const nu = 0.30;                                           // Poisson for memory foam
+    const E = Math.max(1, 500 + brgHardness * 25);             // Young's modulus (Pa) ~25 Pa per hardness unit
     const mu = E / (2 * (1 + nu));                              // shear modulus
     const K = E / (3 * (1 - 2 * nu));                           // bulk modulus
     const tauSlow = Math.max(0.1, brgRebound);                 // dominant relaxation
     const tauFast = tauSlow * 0.1;                             // fast (10%)
     const N = params.gridX * params.gridY * params.gridZ;
-    const totalMass = (brgVolume / 1000) * brgDensity;         // L->m^3 * density = kg
+    // Use weight directly, or compute from volume×density
+    const totalMass = brgVolume > 0.01 ? (brgVolume / 1000) * estDensity : brgWeight;
     const particleMass = totalMass / Math.max(1, N);
-    return { E, nu, mu, K, tauSlow, tauFast, N, totalMass, particleMass };
+    return { E, nu, mu, K, tauSlow, tauFast, N, totalMass, particleMass, estDensity };
   };
 
   const applyBridge = () => {
@@ -405,7 +583,7 @@ export default function SimulatorPage() {
       lambda: Number((d.K - (2 * d.mu) / 3).toFixed(1)),
       youngModulus: Number(d.E.toFixed(1)),
       poissonRatio: Number(d.nu.toFixed(3)),
-      density: brgDensity,
+      density: d.estDensity,
       tau1: Number(d.tauFast.toFixed(2)),
       tau2: Number(d.tauSlow.toFixed(2)),
     }));
@@ -1357,7 +1535,7 @@ export default function SimulatorPage() {
           </div>
           <div>
             <h1 className="text-xl font-bold tracking-tight bg-gradient-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent">
-              Pillow Compression Workbench <span className="text-xs font-mono font-normal text-rose-400 px-2 py-0.5 bg-rose-950/40 border border-rose-800/30 rounded-full ml-2">Implicit Prony Engine</span>
+              枕头模型压力测试 <span className="text-xs font-mono font-normal text-rose-400 px-2 py-0.5 bg-rose-950/40 border border-rose-800/30 rounded-full ml-2">Implicit Prony Engine</span>
             </h1>
             <p className="text-xs text-slate-400">基于 Neo-Hookean 超弹性与 Prony  Prony series 黏弹性的慢回弹枕头受压及凹陷模拟系统</p>
           </div>
@@ -1430,59 +1608,42 @@ export default function SimulatorPage() {
               <Cpu className="w-5 h-5 text-emerald-400" />
               <h2 className="text-sm font-semibold text-slate-200 uppercase tracking-wider">工厂参数桥接 / Parameter Bridge</h2>
             </div>
-            <p className="text-[10px] text-slate-500 leading-relaxed">输入产线宏观测量值（密度·体积 → 质量惯性、硬度 → 弹性模量、回弹时间 → 黏弹松弛），自动解算为底层引擎参数。</p>
+            <p className="text-[10px] text-slate-500 leading-relaxed">输入产线三参数（体积 L、硬度 D、回弹时间 S），自动解算密度→质量、硬度→弹性模量、回弹→黏弹松弛。</p>
 
             <div className="grid grid-cols-2 gap-3 text-[11px]">
               <label className="space-y-1">
-                <span className="text-slate-400">密度 (kg/m³)</span>
-                <input type="number" value={brgDensity} onChange={(e) => setBrgDensity(parseFloat(e.target.value) || 0)}
-                  className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
-              </label>
-              <label className="space-y-1">
-                <span className="text-slate-400">体积 (L 升)</span>
+                <span className="text-slate-400">体积 (L) [0=用重量]</span>
                 <input type="number" step="0.1" value={brgVolume} onChange={(e) => setBrgVolume(parseFloat(e.target.value) || 0)}
                   className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
               </label>
               <label className="space-y-1">
-                <span className="text-slate-400">硬度 (Shore OO)</span>
+                <span className="text-slate-400">重量 (kg)</span>
+                <input type="number" step="0.1" value={brgWeight} onChange={(e) => setBrgWeight(parseFloat(e.target.value) || 0)}
+                  className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
+              </label>
+              <label className="space-y-1">
+                <span className="text-slate-400">硬度 (D)</span>
                 <input type="number" value={brgHardness} onChange={(e) => setBrgHardness(parseFloat(e.target.value) || 0)}
                   className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
               </label>
               <label className="space-y-1">
-                <span className="text-slate-400">回弹时间 (s)</span>
+                <span className="text-slate-400">回弹时间 (S)</span>
                 <input type="number" step="0.1" value={brgRebound} onChange={(e) => setBrgRebound(parseFloat(e.target.value) || 0)}
                   className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
               </label>
             </div>
-
-            {/* Empirical constants (assumed defaults — your message's exact numbers were blank) */}
-            <details className="text-[10px] text-slate-400">
-              <summary className="cursor-pointer text-slate-500">经验常数（硬度→E 线性系数、泊松比）</summary>
-              <div className="grid grid-cols-3 gap-2 mt-2">
-                <label className="space-y-1"><span>E = a·H + b · a</span>
-                  <input type="number" value={brgEa} onChange={(e) => setBrgEa(parseFloat(e.target.value) || 0)}
-                    className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-slate-300" /></label>
-                <label className="space-y-1"><span>b</span>
-                  <input type="number" value={brgEb} onChange={(e) => setBrgEb(parseFloat(e.target.value) || 0)}
-                    className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-slate-300" /></label>
-                <label className="space-y-1"><span>泊松比 ν</span>
-                  <input type="number" step="0.01" value={brgPoisson} onChange={(e) => setBrgPoisson(parseFloat(e.target.value) || 0)}
-                    className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-slate-300" /></label>
-              </div>
-            </details>
 
             {/* Derived readout */}
             {(() => {
               const d = bridgeDerive();
               return (
                 <div className="grid grid-cols-2 gap-2 text-[10px] bg-slate-950/40 border border-slate-800/60 rounded-lg p-2.5 font-mono">
+                  <div className="text-slate-500">估密度 = <span className="text-emerald-400">{d.estDensity.toFixed(0)} kg/m³</span></div>
+                  <div className="text-slate-500">总质量 = <span className="text-emerald-400">{d.totalMass.toFixed(3)} kg</span>{brgVolume > 0.01 ? ' (V×ρ)' : ' (直接)'}</div>
                   <div className="text-slate-500">杨氏 E = <span className="text-emerald-400">{Math.round(d.E)} Pa</span></div>
-                  <div className="text-slate-500">总质量 = <span className="text-emerald-400">{d.totalMass.toFixed(3)} kg</span></div>
                   <div className="text-slate-500">剪切 μ = <span className="text-emerald-400">{Math.round(d.mu)} Pa</span></div>
                   <div className="text-slate-500">体积 K = <span className="text-emerald-400">{Math.round(d.K)} Pa</span></div>
                   <div className="text-slate-500">τ_slow = <span className="text-emerald-400">{d.tauSlow.toFixed(1)} s</span></div>
-                  <div className="text-slate-500">τ_fast = <span className="text-emerald-400">{d.tauFast.toFixed(2)} s</span></div>
-                  <div className="text-slate-500 col-span-2">质点质量 m = M/N = <span className="text-emerald-400">{d.particleMass.toExponential(2)} kg</span>（N={d.N}）</div>
                 </div>
               );
             })()}
@@ -1946,7 +2107,7 @@ export default function SimulatorPage() {
               {(presserShape === 'anatomy' || presserShape === 'custom') && (
                 <div className="space-y-2 bg-slate-950/40 border border-slate-800/50 p-3.5 rounded-lg">
                   <div className="text-[11px] font-semibold text-slate-300">颈曲修形 (21 点 · 头→颈→肩)</div>
-                  <div className="text-[10px] text-slate-500">按高度输入 21 个颈曲数值（第 4 个=枕骨，间隔 16mm）；仅沿 Z 推拉后背面轮廓。</div>
+                  <div className="text-[10px] text-slate-500">21 个颈曲值沿“高度轴”(头→肩)分布；仅把贴枕底面沿“后背偏移轴”推拉。默认：竖直向下(−Y)朝托盘。第 4 个=枕骨，间隔 16mm。</div>
                   <textarea
                     rows={2}
                     value={cervicalInput}
@@ -1954,22 +2115,34 @@ export default function SimulatorPage() {
                     placeholder="0,0,0,0,0.8,1,2.7,3.3,3.5,3.4,2.3,1.4,1.4,1.1,0.3,0.1,0,0,0,0,0"
                     className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-[10px] text-emerald-300 resize-none"
                   />
-                  <div className="grid grid-cols-2 gap-3 text-[10px]">
+                  <div className="grid grid-cols-3 gap-2 text-[10px]">
+                    <label className="space-y-1">
+                      <span className="text-slate-400">高度轴(头→肩)</span>
+                      <select value={cervicalHeightAxis} onChange={(e) => setCervicalHeightAxis(e.target.value as 'x'|'y'|'z')}
+                        className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300">
+                        <option value="x">X</option>
+                        <option value="y">Y</option>
+                        <option value="z">Z</option>
+                      </select>
+                    </label>
+                    <label className="space-y-1">
+                      <span className="text-slate-400">托盘侧轴(贴枕面方向)</span>
+                      <select value={cervicalOffsetAxis} onChange={(e) => setCervicalOffsetAxis(e.target.value as 'x'|'y'|'z')}
+                        className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300">
+                        <option value="x">X</option>
+                        <option value="y">Y</option>
+                        <option value="z">Z</option>
+                      </select>
+                    </label>
                     <label className="space-y-1">
                       <span className="text-slate-400">曲度缩放 (值→单位)</span>
                       <input type="number" step="0.1" value={cervicalScale} onChange={(e) => setCervicalScale(parseFloat(e.target.value) || 0)}
                         className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300" />
                     </label>
-                    <label className="space-y-1">
-                      <span className="text-slate-400">后背朝向</span>
-                      <select value={cervicalBackDir} onChange={(e) => setCervicalBackDir(parseInt(e.target.value) === 1 ? 1 : -1)}
-                        className="w-full bg-slate-950/60 border border-slate-800 rounded px-2 py-1 font-mono text-emerald-300">
-                        <option value={-1}>-Z 方向</option>
-                        <option value={1}>+Z 方向</option>
-                      </select>
-                    </label>
                   </div>
                   <div className="grid grid-cols-2 gap-2">
+                    <button onClick={previewCervicalCurve} className="py-2 bg-sky-700 hover:bg-sky-600 text-white text-xs font-semibold rounded-lg transition col-span-2">预览颈曲几何</button>
+                    <button onClick={buildHeadFromCervical} className="py-2 bg-amber-700 hover:bg-amber-600 text-white text-xs font-semibold rounded-lg transition">从颈曲生成头部</button>
                     <button onClick={applyCervical} className="py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold rounded-lg transition">应用颈曲修形</button>
                     <button onClick={resetHeadShape} className="py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs rounded-lg transition">还原头部</button>
                   </div>
